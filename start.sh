@@ -20,7 +20,9 @@ load_env
 
 RUST_DIR="${RUST_DIR:-$ROOT_DIR/rust}"
 CLAW_BIN="${CLAW_BIN:-$RUST_DIR/target/release/claw}"
-CONDA_ENV_PREFIX="${CONDA_ENV_PREFIX:-/home/yang/miniconda3/envs/claw-local}"
+CONDA_ENV_PREFIX="${CONDA_ENV_PREFIX:-}"
+DEFAULT_CONDA_ENV_PREFIX="${DEFAULT_CONDA_ENV_PREFIX:-/home/yang/miniconda3/envs/claw-local}"
+LOCAL_SERVER_USE_ACTIVE_CONDA="${LOCAL_SERVER_USE_ACTIVE_CONDA:-true}"
 CLAW_PROVIDER="${CLAW_PROVIDER:-poe}"
 CLAW_MODEL="${CLAW_MODEL:-claude-sonnet-4-6}"
 CLAW_PERMISSION_MODE="${CLAW_PERMISSION_MODE:-workspace-write}"
@@ -88,12 +90,33 @@ build_claw() {
   (cd "$RUST_DIR" && cargo build --release -p claw-cli)
 }
 
+resolve_conda_env_prefix() {
+  if [[ -n "$CONDA_ENV_PREFIX" ]]; then
+    printf '%s\n' "$CONDA_ENV_PREFIX"
+    return 0
+  fi
+
+  if [[ "$LOCAL_SERVER_USE_ACTIVE_CONDA" == "true" ]] \
+    && [[ -n "${CONDA_PREFIX:-}" ]] \
+    && [[ "${CONDA_DEFAULT_ENV:-}" != "base" ]]; then
+    printf '%s\n' "$CONDA_PREFIX"
+    return 0
+  fi
+
+  printf '%s\n' "$DEFAULT_CONDA_ENV_PREFIX"
+}
+
 doctor() {
+  local resolved_conda_prefix=""
+  resolved_conda_prefix="$(resolve_conda_env_prefix)"
   echo "ROOT_DIR=$ROOT_DIR"
   echo "ENV_FILE=$ENV_FILE"
   echo "RUST_DIR=$RUST_DIR"
   echo "CLAW_BIN=$CLAW_BIN"
   echo "CONDA_ENV_PREFIX=$CONDA_ENV_PREFIX"
+  echo "DEFAULT_CONDA_ENV_PREFIX=$DEFAULT_CONDA_ENV_PREFIX"
+  echo "LOCAL_SERVER_USE_ACTIVE_CONDA=$LOCAL_SERVER_USE_ACTIVE_CONDA"
+  echo "RESOLVED_CONDA_ENV_PREFIX=$resolved_conda_prefix"
   echo "CLAW_PROVIDER=$CLAW_PROVIDER"
   echo "CLAW_MODEL=$CLAW_MODEL"
   echo "CLAW_PERMISSION_MODE=$CLAW_PERMISSION_MODE"
@@ -386,6 +409,8 @@ run_local_server() {
   require_cmd conda
   require_cmd curl
   unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN ANTHROPIC_BASE_URL POE_API_KEY POE_BASE_URL XAI_API_KEY XAI_BASE_URL
+  local conda_env_prefix
+  conda_env_prefix="$(resolve_conda_env_prefix)"
   local model_id
   model_id="$(resolve_local_model_id)"
   if load_local_server_state \
@@ -406,8 +431,9 @@ run_local_server() {
   echo "Starting local server"
   echo "  Model            $model_id"
   echo "  Base URL         $base_url"
+  echo "  Conda env        $conda_env_prefix"
   echo "  State file       $LOCAL_SERVER_STATE_FILE"
-  exec conda run -p "$CONDA_ENV_PREFIX" transformers serve \
+  exec conda run -p "$conda_env_prefix" transformers serve \
     --host "$LOCAL_SERVER_HOST" \
     --port "$server_port" \
     --device "$LOCAL_SERVER_DEVICE" \
