@@ -9,6 +9,7 @@
 - 支持 `local` 模式，连接本地 OpenAI 兼容模型服务
 - 当前终端所在目录就是智能体工作区
 - 支持交互式会话和单次 prompt
+- 支持类似 Codex 的动态状态栏，实时显示当前分析/搜索/修改阶段
 - 默认使用 `workspace-write`，执行命令仍需人工审批
 - 提供 `claw`、`claw-poe`、`claw-local`、`claw-local-server`、`claw-doctor` 命令
 
@@ -239,6 +240,20 @@ claw-local-server --local-model /home/yang/Downloads/pretrained/Qwen3-4B
 - 智能体可以读写当前工作区文件
 - 执行命令时仍会弹出人工审批
 - 不会默认无条件执行高风险操作
+
+当命令需要额外审批时，当前版本支持：
+
+- `y`：只放行这一次
+- `a`：本次会话里始终放行这类工具
+- `s`：本次会话里放行后续所有升级审批
+
+如果你希望在 `workspace-write` 模式下默认就信任 `bash`，减少审批次数，可以在 [`.env`](/home/yang/Downloads/clawcode/.env) 里设置：
+
+```bash
+CLAW_TRUST_BASH_IN_WORKSPACE_WRITE=true
+```
+
+这样会在当前会话开始时自动把 `bash` 视为“已批准过的升级工具”，更接近 Codex 的交互方式。
 
 如果需要只读模式：
 

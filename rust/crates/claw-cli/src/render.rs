@@ -96,6 +96,12 @@ impl Spinner {
         out.flush()
     }
 
+    pub fn clear(&mut self, out: &mut impl Write) -> io::Result<()> {
+        self.frame_index = 0;
+        execute!(out, MoveToColumn(0), Clear(ClearType::CurrentLine))?;
+        out.flush()
+    }
+
     pub fn fail(
         &mut self,
         label: &str,

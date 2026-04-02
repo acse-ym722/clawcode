@@ -414,6 +414,34 @@ fn default_permission_mode() -> PermissionMode {
         .map_or(PermissionMode::DangerFullAccess, permission_mode_from_label)
 }
 
+fn env_flag(name: &str) -> bool {
+    env::var(name).ok().is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
+fn trust_bash_in_workspace_write_enabled() -> bool {
+    env_flag("CLAW_TRUST_BASH_IN_WORKSPACE_WRITE")
+}
+
+fn initial_approval_state(permission_mode: PermissionMode) -> Arc<Mutex<CliApprovalState>> {
+    let mut approval_state = CliApprovalState::default();
+    if permission_mode == PermissionMode::WorkspaceWrite
+        && trust_bash_in_workspace_write_enabled()
+    {
+        approval_state
+            .allowed_tools
+            .insert(("bash".to_string(), PermissionMode::DangerFullAccess));
+        approval_state
+            .allowed_tools
+            .insert(("Bash".to_string(), PermissionMode::DangerFullAccess));
+    }
+    Arc::new(Mutex::new(approval_state))
+}
+
 fn filter_tool_specs(
     tool_registry: &GlobalToolRegistry,
     allowed_tools: Option<&AllowedToolSet>,
@@ -1058,6 +1086,12 @@ struct ManagedSessionSummary {
     message_count: usize,
 }
 
+#[derive(Debug, Default)]
+struct CliApprovalState {
+    allow_all_escalations: bool,
+    allowed_tools: BTreeSet<(String, PermissionMode)>,
+}
+
 struct LiveCli {
     model: String,
     allowed_tools: Option<AllowedToolSet>,
@@ -1065,6 +1099,7 @@ struct LiveCli {
     system_prompt: Vec<String>,
     runtime: ConversationRuntime<DefaultRuntimeClient, CliToolExecutor>,
     session: SessionHandle,
+    approval_state: Arc<Mutex<CliApprovalState>>,
 }
 
 impl LiveCli {
@@ -1093,6 +1128,7 @@ impl LiveCli {
             system_prompt,
             runtime,
             session,
+            approval_state: initial_approval_state(permission_mode),
         };
         cli.persist_session()?;
         Ok(cli)
@@ -1161,24 +1197,32 @@ impl LiveCli {
     }
 
     fn run_turn(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
-        let mut spinner = Spinner::new();
-        let mut stdout = io::stdout();
-        spinner.tick("Working", TerminalRenderer::new().color_theme(), &mut stdout)?;
-        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
-        let result = self.runtime.run_turn(input, Some(&mut permission_prompter));
+        let mut progress = InternalPromptProgressRun::start_conversation(input);
+        let mut runtime = build_runtime(
+            self.runtime.session().clone(),
+            self.model.clone(),
+            self.system_prompt.clone(),
+            true,
+            true,
+            self.allowed_tools.clone(),
+            self.permission_mode,
+            Some(progress.reporter()),
+        )?;
+        let mut permission_prompter = CliPermissionPrompter::new(
+            self.permission_mode,
+            self.approval_state.clone(),
+            Some(progress.reporter()),
+        );
+        let result = runtime.run_turn(input, Some(&mut permission_prompter));
         match result {
             Ok(_) => {
-                spinner.finish("Done", TerminalRenderer::new().color_theme(), &mut stdout)?;
-                println!();
+                self.runtime = runtime;
+                progress.finish_success();
                 self.persist_session()?;
                 Ok(())
             }
             Err(error) => {
-                spinner.fail(
-                    "Request failed",
-                    TerminalRenderer::new().color_theme(),
-                    &mut stdout,
-                )?;
+                progress.finish_failure(&error.to_string());
                 Err(Box::new(error))
             }
         }
@@ -1207,7 +1251,8 @@ impl LiveCli {
             self.permission_mode,
             None,
         )?;
-        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        let mut permission_prompter =
+            CliPermissionPrompter::new(self.permission_mode, self.approval_state.clone(), None);
         let summary = runtime.run_turn(input, Some(&mut permission_prompter))?;
         self.runtime = runtime;
         self.persist_session()?;
@@ -1448,6 +1493,7 @@ impl LiveCli {
         let previous = self.permission_mode.as_str().to_string();
         let session = self.runtime.session().clone();
         self.permission_mode = permission_mode_from_label(normalized);
+        self.approval_state = initial_approval_state(self.permission_mode);
         self.runtime = build_runtime(
             session,
             self.model.clone(),
@@ -1474,6 +1520,7 @@ impl LiveCli {
         }
 
         self.session = create_managed_session_handle()?;
+        self.approval_state = initial_approval_state(self.permission_mode);
         self.runtime = build_runtime(
             Session::new(),
             self.model.clone(),
@@ -1520,6 +1567,7 @@ impl LiveCli {
             self.permission_mode,
             None,
         )?;
+        self.approval_state = initial_approval_state(self.permission_mode);
         self.session = handle;
         println!(
             "{}",
@@ -1605,6 +1653,7 @@ impl LiveCli {
                     self.permission_mode,
                     None,
                 )?;
+                self.approval_state = initial_approval_state(self.permission_mode);
                 self.session = handle;
                 println!(
                     "Session switched\n  Active session   {}\n  File             {}\n  Messages         {}",
@@ -1689,7 +1738,8 @@ impl LiveCli {
             self.permission_mode,
             progress,
         )?;
-        let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        let mut permission_prompter =
+            CliPermissionPrompter::new(self.permission_mode, self.approval_state.clone(), None);
         let summary = runtime.run_turn(prompt, Some(&mut permission_prompter))?;
         Ok(final_assistant_text(&summary).trim().to_string())
     }
@@ -2628,7 +2678,6 @@ fn resolve_plugin_path(cwd: &Path, config_home: &Path, value: &str) -> PathBuf {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InternalPromptProgressState {
-    command_label: &'static str,
     task_label: String,
     step: usize,
     phase: String,
@@ -2649,6 +2698,8 @@ enum InternalPromptProgressEvent {
 struct InternalPromptProgressShared {
     state: Mutex<InternalPromptProgressState>,
     output_lock: Mutex<()>,
+    spinner: Mutex<Spinner>,
+    theme: render::ColorTheme,
     started_at: Instant,
 }
 
@@ -2665,18 +2716,39 @@ struct InternalPromptProgressRun {
 }
 
 impl InternalPromptProgressReporter {
-    fn ultraplan(task: &str) -> Self {
+    fn conversation(task: &str) -> Self {
+        let renderer = TerminalRenderer::new();
         Self {
             shared: Arc::new(InternalPromptProgressShared {
                 state: Mutex::new(InternalPromptProgressState {
-                    command_label: "Ultraplan",
-                    task_label: task.to_string(),
+                    task_label: truncate_for_summary(task.trim(), 120),
                     step: 0,
-                    phase: "planning started".to_string(),
-                    detail: Some(format!("task: {task}")),
+                    phase: initial_phase_for_task(task).to_string(),
+                    detail: None,
                     saw_final_text: false,
                 }),
                 output_lock: Mutex::new(()),
+                spinner: Mutex::new(Spinner::new()),
+                theme: *renderer.color_theme(),
+                started_at: Instant::now(),
+            }),
+        }
+    }
+
+    fn ultraplan(task: &str) -> Self {
+        let renderer = TerminalRenderer::new();
+        Self {
+            shared: Arc::new(InternalPromptProgressShared {
+                state: Mutex::new(InternalPromptProgressState {
+                    task_label: truncate_for_summary(task.trim(), 120),
+                    step: 0,
+                    phase: initial_phase_for_task(task).to_string(),
+                    detail: Some(truncate_for_summary(task.trim(), 120)),
+                    saw_final_text: false,
+                }),
+                output_lock: Mutex::new(()),
+                spinner: Mutex::new(Spinner::new()),
+                theme: *renderer.color_theme(),
                 started_at: Instant::now(),
             }),
         }
@@ -2685,7 +2757,13 @@ impl InternalPromptProgressReporter {
     fn emit(&self, event: InternalPromptProgressEvent, error: Option<&str>) {
         let snapshot = self.snapshot();
         let line = format_internal_prompt_progress_line(event, &snapshot, self.elapsed(), error);
-        self.write_line(&line);
+        match event {
+            InternalPromptProgressEvent::Complete => self.finish_status(&line, false),
+            InternalPromptProgressEvent::Failed => self.finish_status(&line, true),
+            InternalPromptProgressEvent::Started
+            | InternalPromptProgressEvent::Update
+            | InternalPromptProgressEvent::Heartbeat => self.render_status(&line),
+        }
     }
 
     fn mark_model_phase(&self) {
@@ -2697,14 +2775,14 @@ impl InternalPromptProgressReporter {
                 .expect("internal prompt progress state poisoned");
             state.step += 1;
             state.phase = if state.step == 1 {
-                "analyzing request".to_string()
+                followup_phase_for_task(&state.task_label).to_string()
             } else {
-                "reviewing findings".to_string()
+                "Reviewing findings".to_string()
             };
-            state.detail = Some(format!("task: {}", state.task_label));
+            state.detail = Some(state.task_label.clone());
             state.clone()
         };
-        self.write_line(&format_internal_prompt_progress_line(
+        self.render_status(&format_internal_prompt_progress_line(
             InternalPromptProgressEvent::Update,
             &snapshot,
             self.elapsed(),
@@ -2721,11 +2799,11 @@ impl InternalPromptProgressReporter {
                 .lock()
                 .expect("internal prompt progress state poisoned");
             state.step += 1;
-            state.phase = format!("running {name}");
+            state.phase = phase_for_tool(name).to_string();
             state.detail = Some(detail);
             state.clone()
         };
-        self.write_line(&format_internal_prompt_progress_line(
+        self.render_status(&format_internal_prompt_progress_line(
             InternalPromptProgressEvent::Update,
             &snapshot,
             self.elapsed(),
@@ -2750,11 +2828,11 @@ impl InternalPromptProgressReporter {
             }
             state.saw_final_text = true;
             state.step += 1;
-            state.phase = "drafting final plan".to_string();
+            state.phase = "Drafting response".to_string();
             state.detail = (!detail.is_empty()).then_some(detail);
             state.clone()
         };
-        self.write_line(&format_internal_prompt_progress_line(
+        self.render_status(&format_internal_prompt_progress_line(
             InternalPromptProgressEvent::Update,
             &snapshot,
             self.elapsed(),
@@ -2764,7 +2842,7 @@ impl InternalPromptProgressReporter {
 
     fn emit_heartbeat(&self) {
         let snapshot = self.snapshot();
-        self.write_line(&format_internal_prompt_progress_line(
+        self.render_status(&format_internal_prompt_progress_line(
             InternalPromptProgressEvent::Heartbeat,
             &snapshot,
             self.elapsed(),
@@ -2791,12 +2869,74 @@ impl InternalPromptProgressReporter {
             .lock()
             .expect("internal prompt progress output lock poisoned");
         let mut stdout = io::stdout();
-        let _ = writeln!(stdout, "{line}");
-        let _ = stdout.flush();
+        let mut spinner = self
+            .shared
+            .spinner
+            .lock()
+            .expect("internal prompt progress spinner poisoned");
+        let _ = spinner.tick(line, &self.shared.theme, &mut stdout);
+    }
+
+    fn render_status(&self, line: &str) {
+        self.write_line(line);
+    }
+
+    fn clear_status_line(&self) {
+        let _guard = self
+            .shared
+            .output_lock
+            .lock()
+            .expect("internal prompt progress output lock poisoned");
+        let mut stdout = io::stdout();
+        let mut spinner = self
+            .shared
+            .spinner
+            .lock()
+            .expect("internal prompt progress spinner poisoned");
+        let _ = spinner.clear(&mut stdout);
+    }
+
+    fn finish_status(&self, label: &str, failed: bool) {
+        let _guard = self
+            .shared
+            .output_lock
+            .lock()
+            .expect("internal prompt progress output lock poisoned");
+        let mut stdout = io::stdout();
+        let mut spinner = self
+            .shared
+            .spinner
+            .lock()
+            .expect("internal prompt progress spinner poisoned");
+        let _ = if failed {
+            spinner.fail(label, &self.shared.theme, &mut stdout)
+        } else {
+            spinner.finish(label, &self.shared.theme, &mut stdout)
+        };
     }
 }
 
 impl InternalPromptProgressRun {
+    fn start_conversation(task: &str) -> Self {
+        let reporter = InternalPromptProgressReporter::conversation(task);
+        reporter.emit(InternalPromptProgressEvent::Started, None);
+
+        let (heartbeat_stop, heartbeat_rx) = mpsc::channel();
+        let heartbeat_reporter = reporter.clone();
+        let heartbeat_handle = thread::spawn(move || loop {
+            match heartbeat_rx.recv_timeout(INTERNAL_PROGRESS_HEARTBEAT_INTERVAL) {
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Timeout) => heartbeat_reporter.emit_heartbeat(),
+            }
+        });
+
+        Self {
+            reporter,
+            heartbeat_stop: Some(heartbeat_stop),
+            heartbeat_handle: Some(heartbeat_handle),
+        }
+    }
+
     fn start_ultraplan(task: &str) -> Self {
         let reporter = InternalPromptProgressReporter::ultraplan(task);
         reporter.emit(InternalPromptProgressEvent::Started, None);
@@ -2856,12 +2996,7 @@ fn format_internal_prompt_progress_line(
     error: Option<&str>,
 ) -> String {
     let elapsed_seconds = elapsed.as_secs();
-    let step_label = if snapshot.step == 0 {
-        "current step pending".to_string()
-    } else {
-        format!("current step {}", snapshot.step)
-    };
-    let mut status_bits = vec![step_label, format!("phase {}", snapshot.phase)];
+    let mut status_bits = Vec::new();
     if let Some(detail) = snapshot
         .detail
         .as_deref()
@@ -2869,31 +3004,70 @@ fn format_internal_prompt_progress_line(
     {
         status_bits.push(detail.to_string());
     }
-    let status = status_bits.join(" · ");
+    let detail_suffix = if status_bits.is_empty() {
+        String::new()
+    } else {
+        format!(" · {}", status_bits.join(" · "))
+    };
     match event {
-        InternalPromptProgressEvent::Started => {
-            format!(
-                "🧭 {} status · planning started · {status}",
-                snapshot.command_label
-            )
+        InternalPromptProgressEvent::Started
+        | InternalPromptProgressEvent::Update
+        | InternalPromptProgressEvent::Heartbeat => {
+            format!("{} ({}s){}", snapshot.phase, elapsed_seconds, detail_suffix)
         }
-        InternalPromptProgressEvent::Update => {
-            format!("… {} status · {status}", snapshot.command_label)
-        }
-        InternalPromptProgressEvent::Heartbeat => format!(
-            "… {} heartbeat · {elapsed_seconds}s elapsed · {status}",
-            snapshot.command_label
-        ),
-        InternalPromptProgressEvent::Complete => format!(
-            "✔ {} status · completed · {elapsed_seconds}s elapsed · {} steps total",
-            snapshot.command_label, snapshot.step
-        ),
+        InternalPromptProgressEvent::Complete => format!("Done ({}s)", elapsed_seconds),
         InternalPromptProgressEvent::Failed => format!(
-            "✘ {} status · failed · {elapsed_seconds}s elapsed · {}",
-            snapshot.command_label,
+            "Request failed ({}s) · {}",
+            elapsed_seconds,
             error.unwrap_or("unknown error")
         ),
     }
+}
+
+fn phase_for_tool(name: &str) -> &'static str {
+    match name {
+        "bash" | "Bash" => "Running shell command",
+        "read_file" | "Read" => "Inspecting file contents",
+        "write_file" | "Write" | "edit_file" | "Edit" => "Applying code changes",
+        "glob_search" | "Glob" => "Inspecting repository structure",
+        "grep_search" | "Grep" => "Searching codebase",
+        "web_search" | "WebSearch" => "Searching web",
+        _ => "Running tool",
+    }
+}
+
+fn initial_phase_for_task(task: &str) -> &'static str {
+    let normalized = task.to_ascii_lowercase();
+    if matches_task(&normalized, &["fix", "implement", "edit", "modify", "refactor", "add"]) {
+        "Planning code modifications"
+    } else if matches_task(
+        &normalized,
+        &["summarize", "explain", "review", "analyze", "inspect", "read"],
+    ) {
+        "Inspecting repository context"
+    } else if matches_task(&normalized, &["test", "debug", "trace", "error", "fail"]) {
+        "Investigating runtime behavior"
+    } else {
+        "Planning next steps"
+    }
+}
+
+fn followup_phase_for_task(task: &str) -> &'static str {
+    let normalized = task.to_ascii_lowercase();
+    if matches_task(
+        &normalized,
+        &["summarize", "explain", "review", "analyze", "inspect", "read"],
+    ) {
+        "Inspecting repository structure"
+    } else if matches_task(&normalized, &["test", "debug", "trace", "error", "fail"]) {
+        "Tracing runtime behavior"
+    } else {
+        "Planning code modifications"
+    }
+}
+
+fn matches_task(task: &str, keywords: &[&str]) -> bool {
+    keywords.iter().any(|keyword| task.contains(keyword))
 }
 
 fn describe_tool_progress(name: &str, input: &str) -> String {
@@ -2976,9 +3150,14 @@ fn build_runtime(
             emit_output,
             allowed_tools.clone(),
             tool_registry.clone(),
-            progress_reporter,
+            progress_reporter.clone(),
         )?,
-        CliToolExecutor::new(allowed_tools.clone(), emit_output, tool_registry.clone()),
+        CliToolExecutor::new(
+            allowed_tools.clone(),
+            emit_output,
+            tool_registry.clone(),
+            progress_reporter.clone(),
+        ),
         permission_policy(permission_mode, &tool_registry),
         system_prompt,
         feature_config,
@@ -2987,11 +3166,32 @@ fn build_runtime(
 
 struct CliPermissionPrompter {
     current_mode: PermissionMode,
+    approval_state: Arc<Mutex<CliApprovalState>>,
+    progress_reporter: Option<InternalPromptProgressReporter>,
 }
 
 impl CliPermissionPrompter {
-    fn new(current_mode: PermissionMode) -> Self {
-        Self { current_mode }
+    fn new(
+        current_mode: PermissionMode,
+        approval_state: Arc<Mutex<CliApprovalState>>,
+        progress_reporter: Option<InternalPromptProgressReporter>,
+    ) -> Self {
+        Self {
+            current_mode,
+            approval_state,
+            progress_reporter,
+        }
+    }
+
+    fn auto_allow(&self, request: &runtime::PermissionRequest) -> bool {
+        let state = self
+            .approval_state
+            .lock()
+            .expect("approval state poisoned");
+        state.allow_all_escalations
+            || state
+                .allowed_tools
+                .contains(&(request.tool_name.clone(), request.required_mode))
     }
 }
 
@@ -3020,6 +3220,12 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
         &mut self,
         request: &runtime::PermissionRequest,
     ) -> runtime::PermissionPromptDecision {
+        if self.auto_allow(request) {
+            return runtime::PermissionPromptDecision::Allow;
+        }
+        if let Some(progress_reporter) = &self.progress_reporter {
+            progress_reporter.clear_status_line();
+        }
         let cwd = env::current_dir()
             .ok()
             .map(|path| path.display().to_string())
@@ -3034,22 +3240,39 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
         );
         println!("{}", summarize_permission_input(request));
         println!("  Working dir  {cwd}");
-        print!("Allow once? [y/N]: ");
+        print!("Allow? [y] once / [a] always this tool / [s] trust this session / [n] no: ");
         let _ = io::stdout().flush();
 
         let mut response = String::new();
         match io::stdin().read_line(&mut response) {
             Ok(_) => {
                 let normalized = response.trim().to_ascii_lowercase();
-                if matches!(normalized.as_str(), "y" | "yes") {
-                    runtime::PermissionPromptDecision::Allow
-                } else {
-                    runtime::PermissionPromptDecision::Deny {
+                match normalized.as_str() {
+                    "y" | "yes" => runtime::PermissionPromptDecision::Allow,
+                    "a" | "always" => {
+                        let mut state = self
+                            .approval_state
+                            .lock()
+                            .expect("approval state poisoned");
+                        state
+                            .allowed_tools
+                            .insert((request.tool_name.clone(), request.required_mode));
+                        runtime::PermissionPromptDecision::Allow
+                    }
+                    "s" | "session" => {
+                        let mut state = self
+                            .approval_state
+                            .lock()
+                            .expect("approval state poisoned");
+                        state.allow_all_escalations = true;
+                        runtime::PermissionPromptDecision::Allow
+                    }
+                    _ => runtime::PermissionPromptDecision::Deny {
                         reason: format!(
                             "tool '{}' denied by user approval prompt",
                             request.tool_name
                         ),
-                    }
+                    },
                 }
             }
             Err(error) => runtime::PermissionPromptDecision::Deny {
@@ -3170,6 +3393,7 @@ impl ApiClient for DefaultRuntimeClient {
                             if !visible.is_empty() {
                                 if let Some(progress_reporter) = &self.progress_reporter {
                                     progress_reporter.mark_text_phase(&visible);
+                                    progress_reporter.clear_status_line();
                                 }
                                 if let Some(rendered) = markdown_stream.push(&renderer, &visible) {
                                     write!(out, "{rendered}")
@@ -3189,6 +3413,9 @@ impl ApiClient for DefaultRuntimeClient {
                     },
                     ApiStreamEvent::ContentBlockStop(_) => {
                         if let Some(rendered) = markdown_stream.flush(&renderer) {
+                            if let Some(progress_reporter) = &self.progress_reporter {
+                                progress_reporter.clear_status_line();
+                            }
                             write!(out, "{rendered}")
                                 .and_then(|()| out.flush())
                                 .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -3196,6 +3423,7 @@ impl ApiClient for DefaultRuntimeClient {
                         if let Some((id, name, input)) = pending_tool.take() {
                             if let Some(progress_reporter) = &self.progress_reporter {
                                 progress_reporter.mark_tool_phase(&name, &input);
+                                progress_reporter.clear_status_line();
                             }
                             // Display tool call now that input is fully accumulated
                             writeln!(out, "\n{}", format_tool_call_start(&name, &input))
@@ -3216,6 +3444,9 @@ impl ApiClient for DefaultRuntimeClient {
                         saw_stop = true;
                         let visible = think_filter.flush();
                         if !visible.is_empty() {
+                            if let Some(progress_reporter) = &self.progress_reporter {
+                                progress_reporter.clear_status_line();
+                            }
                             if let Some(rendered) = markdown_stream.push(&renderer, &visible) {
                                 write!(out, "{rendered}")
                                     .and_then(|()| out.flush())
@@ -3224,6 +3455,9 @@ impl ApiClient for DefaultRuntimeClient {
                             events.push(AssistantEvent::TextDelta(visible));
                         }
                         if let Some(rendered) = markdown_stream.flush(&renderer) {
+                            if let Some(progress_reporter) = &self.progress_reporter {
+                                progress_reporter.clear_status_line();
+                            }
                             write!(out, "{rendered}")
                                 .and_then(|()| out.flush())
                                 .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -3982,6 +4216,7 @@ struct CliToolExecutor {
     emit_output: bool,
     allowed_tools: Option<AllowedToolSet>,
     tool_registry: GlobalToolRegistry,
+    progress_reporter: Option<InternalPromptProgressReporter>,
 }
 
 impl CliToolExecutor {
@@ -3989,12 +4224,14 @@ impl CliToolExecutor {
         allowed_tools: Option<AllowedToolSet>,
         emit_output: bool,
         tool_registry: GlobalToolRegistry,
+        progress_reporter: Option<InternalPromptProgressReporter>,
     ) -> Self {
         Self {
             renderer: TerminalRenderer::new(),
             emit_output,
             allowed_tools,
             tool_registry,
+            progress_reporter,
         }
     }
 }
@@ -4015,6 +4252,9 @@ impl ToolExecutor for CliToolExecutor {
         match self.tool_registry.execute(tool_name, &value) {
             Ok(output) => {
                 if self.emit_output {
+                    if let Some(progress_reporter) = &self.progress_reporter {
+                        progress_reporter.clear_status_line();
+                    }
                     let markdown = format_tool_result(tool_name, &output, false);
                     self.renderer
                         .stream_markdown(&markdown, &mut io::stdout())
@@ -4024,6 +4264,9 @@ impl ToolExecutor for CliToolExecutor {
             }
             Err(error) => {
                 if self.emit_output {
+                    if let Some(progress_reporter) = &self.progress_reporter {
+                        progress_reporter.clear_status_line();
+                    }
                     let markdown = format_tool_result(tool_name, &error, true);
                     self.renderer
                         .stream_markdown(&markdown, &mut io::stdout())
@@ -4237,6 +4480,7 @@ fn print_help() {
 #[cfg(test)]
 mod tests {
     use super::{
+        CliApprovalState, CliPermissionPrompter,
         describe_tool_progress, filter_tool_specs, format_compact_report, format_cost_report,
         format_internal_prompt_progress_line, format_model_report, format_model_switch_report,
         format_permissions_report, format_permissions_switch_report, format_resume_report,
@@ -4252,7 +4496,9 @@ mod tests {
     use plugins::{PluginTool, PluginToolDefinition, PluginToolPermission};
     use runtime::{AssistantEvent, ContentBlock, ConversationMessage, MessageRole, PermissionMode};
     use serde_json::json;
+    use std::collections::BTreeSet;
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tools::GlobalToolRegistry;
 
@@ -5000,12 +5246,11 @@ mod tests {
     }
 
     #[test]
-    fn ultraplan_progress_lines_include_phase_step_and_elapsed_status() {
+    fn ultraplan_progress_lines_include_phase_and_elapsed_status() {
         let snapshot = InternalPromptProgressState {
-            command_label: "Ultraplan",
             task_label: "ship plugin progress".to_string(),
             step: 3,
-            phase: "running read_file".to_string(),
+            phase: "reading files".to_string(),
             detail: Some("reading rust/crates/claw-cli/src/main.rs".to_string()),
             saw_final_text: false,
         };
@@ -5035,14 +5280,13 @@ mod tests {
             Some("network timeout"),
         );
 
-        assert!(started.contains("planning started"));
-        assert!(started.contains("current step 3"));
-        assert!(heartbeat.contains("heartbeat"));
-        assert!(heartbeat.contains("9s elapsed"));
-        assert!(heartbeat.contains("phase running read_file"));
-        assert!(completed.contains("completed"));
-        assert!(completed.contains("3 steps total"));
-        assert!(failed.contains("failed"));
+        assert!(started.contains("reading files"));
+        assert!(started.contains("reading rust/crates/claw-cli/src/main.rs"));
+        assert!(heartbeat.contains("reading files"));
+        assert!(heartbeat.contains("(9s)"));
+        assert!(heartbeat.contains("reading rust/crates/claw-cli/src/main.rs"));
+        assert_eq!(completed, "Done (12s)");
+        assert!(failed.contains("Request failed (12s)"));
         assert!(failed.contains("network timeout"));
     }
 
@@ -5060,6 +5304,30 @@ mod tests {
             describe_tool_progress("grep_search", r#"{"pattern":"ultraplan","path":"rust"}"#),
             "grep `ultraplan` in rust"
         );
+    }
+
+    #[test]
+    fn permission_prompter_reuses_session_approvals() {
+        let approval_state = Arc::new(Mutex::new(CliApprovalState {
+            allow_all_escalations: false,
+            allowed_tools: BTreeSet::from([(
+                "bash".to_string(),
+                PermissionMode::DangerFullAccess,
+            )]),
+        }));
+        let prompter = CliPermissionPrompter::new(
+            PermissionMode::WorkspaceWrite,
+            approval_state,
+            None,
+        );
+        let request = runtime::PermissionRequest {
+            tool_name: "bash".to_string(),
+            input: r#"{"command":"pwd"}"#.to_string(),
+            current_mode: PermissionMode::WorkspaceWrite,
+            required_mode: PermissionMode::DangerFullAccess,
+        };
+
+        assert!(prompter.auto_allow(&request));
     }
 
     #[test]
