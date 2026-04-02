@@ -11,6 +11,7 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -2700,6 +2701,7 @@ struct InternalPromptProgressShared {
     output_lock: Mutex<()>,
     spinner: Mutex<Spinner>,
     theme: render::ColorTheme,
+    pause_depth: AtomicUsize,
     started_at: Instant,
 }
 
@@ -2730,6 +2732,7 @@ impl InternalPromptProgressReporter {
                 output_lock: Mutex::new(()),
                 spinner: Mutex::new(Spinner::new()),
                 theme: *renderer.color_theme(),
+                pause_depth: AtomicUsize::new(0),
                 started_at: Instant::now(),
             }),
         }
@@ -2749,6 +2752,7 @@ impl InternalPromptProgressReporter {
                 output_lock: Mutex::new(()),
                 spinner: Mutex::new(Spinner::new()),
                 theme: *renderer.color_theme(),
+                pause_depth: AtomicUsize::new(0),
                 started_at: Instant::now(),
             }),
         }
@@ -2863,6 +2867,9 @@ impl InternalPromptProgressReporter {
     }
 
     fn write_line(&self, line: &str) {
+        if self.shared.pause_depth.load(Ordering::SeqCst) > 0 {
+            return;
+        }
         let _guard = self
             .shared
             .output_lock
@@ -2894,6 +2901,30 @@ impl InternalPromptProgressReporter {
             .lock()
             .expect("internal prompt progress spinner poisoned");
         let _ = spinner.clear(&mut stdout);
+    }
+
+    fn pause(&self) {
+        let previous = self.shared.pause_depth.fetch_add(1, Ordering::SeqCst);
+        if previous == 0 {
+            self.clear_status_line();
+        }
+    }
+
+    fn resume(&self) {
+        let previous = self.shared.pause_depth.load(Ordering::SeqCst);
+        if previous == 0 {
+            return;
+        }
+        let next = self.shared.pause_depth.fetch_sub(1, Ordering::SeqCst) - 1;
+        if next == 0 {
+            let snapshot = self.snapshot();
+            self.render_status(&format_internal_prompt_progress_line(
+                InternalPromptProgressEvent::Update,
+                &snapshot,
+                self.elapsed(),
+                None,
+            ));
+        }
     }
 
     fn finish_status(&self, label: &str, failed: bool) {
@@ -3224,7 +3255,7 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
             return runtime::PermissionPromptDecision::Allow;
         }
         if let Some(progress_reporter) = &self.progress_reporter {
-            progress_reporter.clear_status_line();
+            progress_reporter.pause();
         }
         let cwd = env::current_dir()
             .ok()
@@ -3244,7 +3275,7 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
         let _ = io::stdout().flush();
 
         let mut response = String::new();
-        match io::stdin().read_line(&mut response) {
+        let decision = match io::stdin().read_line(&mut response) {
             Ok(_) => {
                 let normalized = response.trim().to_ascii_lowercase();
                 match normalized.as_str() {
@@ -3278,7 +3309,11 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
             Err(error) => runtime::PermissionPromptDecision::Deny {
                 reason: format!("permission approval failed: {error}"),
             },
+        };
+        if let Some(progress_reporter) = &self.progress_reporter {
+            progress_reporter.resume();
         }
+        decision
     }
 }
 
