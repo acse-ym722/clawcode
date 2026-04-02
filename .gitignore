@@ -1,0 +1,17 @@
+__pycache__/
+archive/
+.omx/
+.clawd-agents/
+.codex
+.env
+.env.local
+.claw/local-server.env
+.claw/sessions/
+.port_sessions/
+.sandbox-home/
+.sandbox-tmp/
+rust/.claw/
+# Claude Code local artifacts
+.claude/settings.local.json
+.claude/sessions/
+claw-local-model*
